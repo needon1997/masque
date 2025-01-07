@@ -228,11 +228,12 @@ func handleReq(c net.Conn, logger *slog.Logger) {
 	}
 }
 
-func connectToRelay(certData []byte, logger *slog.Logger) (*masqueH2.Client, error) {
+func connectToRelay(certData []byte, logger *slog.Logger, keyLog io.Writer) (*masqueH2.Client, error) {
 	config := masqueH2.ClientConfig{
 		ProxyAddr:  fmt.Sprintf("%v:%v", *invisvRelay, *invisvRelayPort),
 		AuthToken:  *token,
 		Logger:     logger,
+		KeyLog:     keyLog,
 		CertData:   certData,
 		IgnoreCert: *insecure,
 	}
@@ -279,6 +280,13 @@ func main() {
 	certDataFile = flag.String("certDataFile", "", "File containing cert data for TLS cert pinning")
 	verbose = flag.Bool("verbose", false, "Whether to log at DEBUG level")
 
+	var keyLog io.Writer
+	f, err := os.Create("./sslkey.log")
+	if err != nil {
+	}
+	defer f.Close()
+	keyLog = f
+
 	flag.Parse()
 	if token == nil || *token == "" || invisvRelay == nil || *invisvRelay == "" {
 		flag.Usage()
@@ -314,7 +322,7 @@ func main() {
 		}
 	}
 
-	c, err := connectToRelay(certData, logger)
+	c, err := connectToRelay(certData, logger, keyLog)
 	if err != nil {
 		log.Fatalf("Error in connect to relay: %v", err)
 	}

@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -104,6 +106,8 @@ type ClientConfig struct {
 	Insecure bool
 
 	Logger *slog.Logger
+
+	KeyLog io.Writer
 }
 
 // DatagramStream is an object for Proxied UDP Streams that implements I/O functionality.
@@ -198,9 +202,9 @@ func NewClient(config ClientConfig) (*Client, error) {
 	qconf := quic.Config{
 		EnableDatagrams:    true,
 		MaxIncomingStreams: opt.MaxIncomingStreams,
-		MaxIdleTimeout:     opt.MaxIdleTimeout,
+		MaxIdleTimeout:     time.Minute * 10,
+		KeepAlivePeriod:    time.Second * 10,
 	}
-
 	tlsClientConfig := &tls.Config{}
 
 	if opt.Insecure {
@@ -213,6 +217,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 
 		tlsClientConfig.VerifyPeerCertificate = certVerify
 	}
+	tlsClientConfig.KeyLogWriter = opt.KeyLog
 
 	roundTripper := &quich3.RoundTripper{
 		TLSClientConfig: tlsClientConfig,
@@ -439,13 +444,16 @@ func (c *Client) CreateTCPStream(destAddr string) (quich3.Stream, error) {
 // Returns a DatagramStream object that becomes the responsibility of the caller to Close().
 // destAddr should be in ip:port format, where ip CANNOT be a DNS address.
 func (c *Client) CreateUDPStream(destAddr string) (*DatagramStream, error) {
-	fullAddr := fmt.Sprintf("masque://%s/", destAddr)
-
-	req, err := http.NewRequest("CONNECT-UDP", fullAddr, nil)
+	addr, err := net.ResolveUDPAddr("udp", destAddr)
+	if err != nil {
+		// handle error
+	}
+	fullAddr := fmt.Sprintf("https://%s/masque/%s/%d", c.proxyAddr, addr.IP, addr.Port)
+	req, err := http.NewRequest("CONNECT", fullAddr, nil)
 	if err != nil {
 		return nil, err
 	}
-
+	req.Proto = "connect-udp"
 	if c.authToken != "" {
 		req.Header.Add("Proxy-Authorization", fmt.Sprintf("PrivacyToken token=%s", c.authToken))
 	}

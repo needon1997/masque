@@ -113,6 +113,14 @@ func main() {
 
 	flag.Parse()
 
+	var err error
+	var keyLog io.Writer
+	f, err := os.Create("./sslkey.log")
+	if err != nil {
+	}
+	defer f.Close()
+	keyLog = f
+
 	if *targetServer == "" {
 		flag.Usage()
 		log.Fatal("targetServer flag is required")
@@ -134,7 +142,6 @@ func main() {
 		}()
 	}
 
-	var err error
 	var certData []byte
 
 	if *certDataFile != "" {
@@ -181,6 +188,7 @@ func main() {
 		Insecure:  *insecure,
 		CertData:  certData,
 		Logger:    logger,
+		KeyLog:    keyLog,
 	}
 
 	relayClient, err := masqueH3.NewClient(config)

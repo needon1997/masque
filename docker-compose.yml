@@ -1,12 +1,10 @@
-version: "3.3"
-
+networks:
+  default:
+    external:
+       name: docker-server
 services:
   h2o:
     build: ./testdata/h2o
-    ports:
-      - "8081:8081/tcp"
-      - "8444:8444/tcp"
-      - "8444:8444/udp"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Using Volumes here instead of COPYing in the Dockerfile allows us to make changes to configuration files and/or

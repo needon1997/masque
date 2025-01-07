@@ -1,7 +1,7 @@
 package http2
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -11,12 +11,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/invisv-privacy/masque"
 	"github.com/invisv-privacy/masque/internal/utils"
+	"github.com/quic-go/quic-go/quicvarint"
 	gohttp2 "golang.org/x/net/http2"
 	"inet.af/netaddr"
 )
@@ -55,6 +57,7 @@ type Client struct {
 	mu              sync.Mutex
 	logger          *slog.Logger
 	ignoreCert      bool
+	keyLog          io.Writer
 }
 
 // ClientConfig is a configuration for a MASQUE client to be used to set
@@ -66,6 +69,7 @@ type ClientConfig struct {
 	CertData        []byte
 	LowLatencyAddrs []string
 	Logger          *slog.Logger
+	KeyLog          io.Writer
 	IgnoreCert      bool
 }
 
@@ -93,6 +97,7 @@ func NewClient(config ClientConfig) *Client {
 		lowLatencyAddrs: l,
 		logger:          config.Logger.With("config", redactedConfig),
 		ignoreCert:      config.IgnoreCert,
+		keyLog:          config.KeyLog,
 	}
 	return c
 }
@@ -317,7 +322,8 @@ func (c *Client) makeTLSDialer() *tls.Dialer {
 		NetDialer: &d,
 	}
 	if c.ignoreCert {
-		t.Config = &tls.Config{InsecureSkipVerify: true}
+		t.Config = &tls.Config{InsecureSkipVerify: true, KeyLogWriter: c.keyLog, NextProtos: []string{
+			"h2"}}
 	} else if len(c.certData) > 0 {
 		// This codepath is for when we're pinning to a specific proxy certificate.
 		// In that case, what we care about is doing an exact match, not normal
@@ -328,7 +334,8 @@ func (c *Client) makeTLSDialer() *tls.Dialer {
 			return nil
 		}
 
-		t.Config = &tls.Config{InsecureSkipVerify: true, VerifyPeerCertificate: certVerify}
+		t.Config = &tls.Config{InsecureSkipVerify: true, VerifyPeerCertificate: certVerify, KeyLogWriter: c.keyLog, NextProtos: []string{
+			"h2"}}
 	}
 
 	return t
@@ -418,35 +425,26 @@ func StreamDataToDatagramChunk(payload []byte, l int) ([]byte, int) {
 // datagramChunkToStreamData converts an encoded datagram chunk into a UDP raw byte slice.
 // The input parameters are the CONNECT-UDP datagram chunk (chunk) and the payload length (len).
 // It returns the decoded data in a byte slice and its total length.
-func (c *Client) datagramChunkToStreamData(chunk []byte, chunkLength int) ([]byte, int) {
+func (c *Client) datagramChunkToStreamData(chunk []byte, chunkLength int) ([]byte, int, []byte) {
+	c.logger.Info("read", "length", strconv.Itoa(chunkLength), "head", strconv.Itoa(int(chunk[0])))
 	if chunkLength < 2 || chunk[0] != 0 {
-		return []byte{}, 0
+		return []byte{}, 0, []byte{}
 	}
-	v := chunk[1]
-	if v&byte(0b11000000) == 0 { // 1-byte length encoding
-		decode := chunk[2:]
-		return decode, chunkLength - 2
+	chunk = chunk[1:]
+	reader := bytes.NewReader(chunk)
+	r := quicvarint.NewReader(reader)
+	vlen, err := quicvarint.Read(r)
+	if err != nil {
+		c.logger.Error("Datagram chunk encoding error", "chunk", chunk, "len", chunkLength)
+		return []byte{}, 0, []byte{}
 	}
-	if v&byte(0b11000000) == 0x40 { // 2-byte length encoding
-		decode := chunk[3:]
-		return decode, chunkLength - 3
-	}
-	if v&byte(0b11000000) == 0x80 { // 4-byte length encoding
-		decode := chunk[4:]
-		return decode, chunkLength - 4
-	}
-	if v&byte(0b11000000) == 0xc0 { // 8-byte length encoding
-		decode := chunk[9:]
-		return decode, chunkLength - 9
-	}
-	c.logger.Error("Datagram chunk encoding error", "chunk", chunk, "len", chunkLength)
-	return []byte{}, 0
+	return chunk[(len(chunk) - reader.Len()) : (len(chunk)-reader.Len())+int(vlen)], int(vlen), chunk[(len(chunk)-reader.Len())+int(vlen):]
 }
 
 // encodeLoopUDP encodes data and sends it to the proxied UDP stream.
 // |udp.transport| should be the TLS connection's reader from proxy.
 // |src| should be the external data input.
-func (c *Client) encodeLoopUDP(udp *Conn, src *io.PipeReader) {
+func (c *Client) encodeLoopUDP(udp *Conn, dst *io.PipeWriter, src *io.PipeReader) {
 	data := make([]byte, 1460)
 loop:
 	for {
@@ -469,7 +467,7 @@ loop:
 					toSend := data[:n]
 					chunk, n := StreamDataToDatagramChunk(toSend, n)
 					if n > 0 {
-						_, err := udp.transport.Write(chunk)
+						_, err := dst.Write(chunk)
 						if err != nil {
 							c.logger.Error("Error in encodeLoopUDP udp.transport.Write", "id", udp.Sid(), "err", err)
 							break loop
@@ -479,7 +477,9 @@ loop:
 			}
 		}
 	}
-
+	if err := dst.Close(); err != nil {
+		c.logger.Error("Error from udp.doClose in encodeLoopUDP", "err", err)
+	}
 	if err := udp.doClose(); err != nil {
 		c.logger.Error("Error from udp.doClose in encodeLoopUDP", "err", err)
 	}
@@ -488,8 +488,10 @@ loop:
 // decodeLoopUDP decodes data received from the proxied UDP stream.
 // |udp.transport| should be the TLS connection's reader from proxy.
 // |dst| should be the external data output.
-func (c *Client) decodeLoopUDP(dst *io.PipeWriter, udp *Conn) {
+func (c *Client) decodeLoopUDP(src io.ReadCloser, dst *io.PipeWriter, udp *Conn) {
+	var tmp []byte
 	buf := make([]byte, 1500)
+	tmp = nil
 loop:
 	for {
 		select {
@@ -499,7 +501,10 @@ loop:
 		default:
 			{
 				// r.Read returns any number of bytes (and EOF) that present in its buffer.
-				n, err := udp.transport.Read(buf)
+
+				var chunk []byte
+
+				n, err := src.Read(buf)
 				if err != nil {
 					if err == io.EOF {
 						c.logger.Warn("EOF in udp.transport.Read")
@@ -508,15 +513,27 @@ loop:
 					c.logger.Error("Error in decodeLoopUDP udp.transport.Read", "id", udp.Sid(), "err", err)
 					break loop
 				}
-
-				chunk := buf[:n:n]
-				data, n := c.datagramChunkToStreamData(chunk, n)
+				c.logger.Info("read", "nbytes", strconv.Itoa(n))
+				if tmp != nil {
+					chunk = append(tmp[:], buf[:n:n]...)
+					tmp = nil
+				} else {
+					chunk = buf[:n:n]
+				}
+				c.logger.Info("after append", "nbytes", strconv.Itoa(len(chunk)))
+				data, n, rest := c.datagramChunkToStreamData(chunk, len(chunk))
 				if n > 0 {
+					c.logger.Info("decode", "nbytes", strconv.Itoa(n))
 					_, err = dst.Write(data)
 					if err != nil {
 						c.logger.Error("Error in decodeLoopUDP dst.Write", "id", udp.Sid(), "err", err)
 						break loop
 					}
+				}
+				if len(rest) > 0 {
+					tmp = make([]byte, len(rest))
+					copy(tmp, rest)
+					c.logger.Info("after storing", "length", strconv.Itoa(len(tmp)), "head", strconv.Itoa(int(tmp[0])))
 				}
 			}
 		}
@@ -537,75 +554,67 @@ loop:
 //
 // Otherwise, it returns nil and indicates the error. It refills the connection for
 // the next call.
-func (c *Client) CreateUDPStream(addr string) (*Conn, error) {
-	if c.tlsConn == nil {
-		newTr, err := c.dialProxyViaTLS()
-		if err == nil {
-			c.tlsConn = newTr
+func (c *Client) CreateUDPStream(destAddr string) (*Conn, error) {
+	if c.h2Transport == nil {
+		return nil, errors.New("HTTP2 connection has not been established")
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", destAddr)
+	if err != nil {
+		// handle error
+	}
+	fullAddr := fmt.Sprintf("https://%s/tcp?address=%s&port=%d&proto=udp", c.proxyAddr, addr.IP, addr.Port)
+	pr, pw := io.Pipe()
+	req, err := http.NewRequest("GET", fullAddr, pr)
+	if err != nil {
+		return nil, err
+	}
+	if c.authToken != "" {
+		req.Header.Set("Proxy-Authorization", fmt.Sprintf("PrivacyToken token=%s", c.authToken))
+	} else {
+		return nil, errors.New("No proxy authorization token supplied, can't connect without one.")
+	}
+
+	for i := 0; i < MAX_RETRIES; i += 1 {
+		// Find a gohttp2.ClientConn that can take the request.
+		_, lowlatency := c.lowLatencyAddrs[destAddr]
+		h2Conn, err := c.getReadyH2ClientConnOpt(destAddr, lowlatency)
+		if err != nil {
+			return nil, err
+		}
+
+		// Send the request and get response.
+		req.URL.Host = c.proxyAddr
+		resp, err := h2Conn.RoundTrip(req)
+		if err != nil {
+			c.logger.Error("Error calling h2Conn.RoundTrip", "err", err, "req", req)
 		} else {
-			return nil, fmt.Errorf("TLS. Failed to start a new tls conn to proxy. %v", err)
+			c.mu.Lock()
+			inR, inW := io.Pipe()
+			outR, outW := io.Pipe()
+			ctx, cancel := context.WithCancel(context.Background())
+			udp := &Conn{
+				sid:        getNextUdpStreamID(),
+				IoInc:      inW,
+				IoOut:      outR,
+				alive:      true,
+				connCtx:    ctx,
+				connCancel: cancel,
+				isTcp:      false,
+				cleanup:    c.connCleanup(),
+			}
+			c.udpReqs[udp.sid] = udp
+			c.mu.Unlock()
+			go c.encodeLoopUDP(udp, pw, inR)
+			// read from |udp.transport|, send to |IoOut|
+			go c.decodeLoopUDP(resp.Body, outW, udp)
+
+			return udp, nil
 		}
 	}
-
-	ipPort, err := netaddr.ParseIPPort(addr)
-	if err != nil {
-		return nil, errors.New("an invalid destination addr: not a IPPort")
-	}
-
-	// Note: do not reuse a TLS connection. otherwise, the response is likely to be an error response.
-	tr := c.tlsConn
-	c.tlsConn = nil
-
-	// Craft a HTTP/1.1 CONNECT-UDP request
-	req := fmt.Sprintf("CONNECT-UDP masque://%s/ HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: PrivacyToken token=%s\r\n\r\n",
-		ipPort.String(), ipPort.String(), c.authToken)
-
-	// Send the request and receive the CONNECT-UDP response
-	if _, err = tr.Write([]byte(req)); err != nil {
-		return nil, fmt.Errorf("failed to send a CONNECT-UDP request. %v", err)
-	}
-
-	br := bufio.NewReader(tr)
-	resp, err := http.ReadResponse(br, nil)
-
-	if err != nil {
-		if err := tr.Close(); err != nil {
-			c.logger.Error("Error from tr.Close", "err", err)
-		}
-		return nil, fmt.Errorf("reading HTTP response from CONNECT-UDP to %s via proxy %s failed: %v",
-			addr, c.proxyAddr, err)
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("proxy error from %s while dialing %s: %v",
-			c.proxyAddr, addr, resp.Status)
-	}
-
-	c.mu.Lock()
-	// We have to use two pairs of I/O pipe here because of encoding/decoding.
-	// TODO: switch to use buffered writer for the input channel
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-	ctx, cancel := context.WithCancel(context.Background())
-	udp := &Conn{
-		sid:        getNextUdpStreamID(),
-		IoInc:      inW,
-		IoOut:      outR,
-		transport:  tr,
-		alive:      true,
-		connCtx:    ctx,
-		connCancel: cancel,
-		isTcp:      false,
-		cleanup:    c.connCleanup(),
-	}
-	c.udpReqs[udp.sid] = udp
-	c.mu.Unlock()
 
 	// read from |IoInc|, send to |udp.transport|
-	go c.encodeLoopUDP(udp, inR)
-	// read from |udp.transport|, send to |IoOut|
-	go c.decodeLoopUDP(outW, udp)
-
-	return udp, nil
+	return nil, errors.New("unable to establish an h2Conn")
 }
 
 func (c *Client) connCleanup() connCleanupFunc {
